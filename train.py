@@ -11,7 +11,7 @@ import os
 from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 
-def create_real_lr_hr_pairs(anadem_path, geosampa_path, output_dir, patch_size=30):
+def create_real_lr_hr_pairs(anadem_path, geosampa_path, output_dir, patch_size=15):
     """
     Cria pares LR-HR REAIS usando ANADEM (LR) e GEOSAMPA (HR).
     Abordagem simplificada: usar GEOSAMPA para criar LR artificial + HR real.
@@ -25,9 +25,9 @@ def create_real_lr_hr_pairs(anadem_path, geosampa_path, output_dir, patch_size=3
     if ds_geosampa is None:
         raise RuntimeError("Não foi possível abrir GEOSAMPA")
     
-    # Usar região válida conhecida do GEOSAMPA
+    # Usar região válida conhecida do GEOSAMPA (otimizada para 40x)
     x_start, y_start = 18437, 13802
-    region_width, region_height = 2000, 2000
+    region_width, region_height = 800, 800  # Suficiente para patches 600x600
     
     print(f"📍 Usando região GEOSAMPA: ({x_start}, {y_start}) - {region_width}x{region_height}")
     
@@ -51,26 +51,45 @@ def create_real_lr_hr_pairs(anadem_path, geosampa_path, output_dir, patch_size=3
     patches_lr = []
     patches_hr = []
     
-    stride = patch_size // 2  # Overlap de 50%
-    scale_factor = 3  # Usar 3x para ser mais realista
+    stride = patch_size * 2  # Overlap balanceado para 3x
+    scale_factor = 3  # 3x super-resolution (30m → 10m)
     
+    print(f"🔍 Extraindo patches: stride={stride}, patch_size={patch_size}, scale_factor={scale_factor}")
+    print(f"🔍 Range Y: 0 a {region_height - patch_size * scale_factor + 1}")
+    print(f"🔍 Range X: 0 a {region_width - patch_size * scale_factor + 1}")
+    
+    patch_count = 0
     for y in range(0, region_height - patch_size * scale_factor + 1, stride):
         for x in range(0, region_width - patch_size * scale_factor + 1, stride):
-            # Extrair patch HR (90x90 do GEOSAMPA)
+            patch_count += 1
+            if patch_count % 10 == 0:
+                print(f"🔍 Processando patch {patch_count} em ({x}, {y})")
+            
+            # Extrair patch HR (45x45 do GEOSAMPA)
             hr_patch = geosampa_data[y:y+patch_size*scale_factor, x:x+patch_size*scale_factor]
             
             # Verificar se patch tem dados válidos
             patch_valid = valid_mask[y:y+patch_size*scale_factor, x:x+patch_size*scale_factor]
-            if np.sum(patch_valid) < (patch_size * scale_factor)**2 * 0.8:
+            valid_ratio = np.sum(patch_valid) / (patch_size * scale_factor)**2
+            if valid_ratio < 0.8:
+                if patch_count <= 5:  # Debug apenas os primeiros
+                    print(f"❌ Patch {patch_count} rejeitado: {valid_ratio:.2%} válido")
                 continue
             
-            # Criar LR artificial (30x30) a partir do HR
+            # Criar LR artificial (15x15) a partir do HR
             lr_patch = create_realistic_lr_from_hr(hr_patch, scale_factor)
             
             # Validar par
             if validate_real_patch_pair(lr_patch, hr_patch):
                 patches_lr.append(lr_patch)
                 patches_hr.append(hr_patch)
+                if len(patches_lr) <= 5:  # Debug apenas os primeiros
+                    print(f"✅ Patch {patch_count} aceito: {valid_ratio:.2%} válido")
+            else:
+                if patch_count <= 5:  # Debug apenas os primeiros
+                    print(f"❌ Patch {patch_count} falhou na validação")
+    
+    print(f"🔍 Total de posições testadas: {patch_count}")
     
     print(f"✅ Criados {len(patches_lr)} pares LR-HR reais")
     
@@ -95,11 +114,15 @@ def create_realistic_lr_from_hr(hr_patch, scale_factor):
     """
     
     # Método 1: Downsampling com blur (mais realístico)
-    # Aplicar blur gaussiano antes do downsampling
-    blurred = cv2.GaussianBlur(hr_patch, (scale_factor, scale_factor), 0)
+    # Aplicar blur gaussiano antes do downsampling (kernel deve ser ímpar)
+    kernel_size = min(scale_factor, 15)  # Limitar tamanho do kernel
+    if kernel_size % 2 == 0:
+        kernel_size += 1  # Garantir que seja ímpar
     
-    # Downsample
-    lr_small = cv2.resize(blurred, (30, 30), interpolation=cv2.INTER_AREA)
+    blurred = cv2.GaussianBlur(hr_patch, (kernel_size, kernel_size), 0)
+    
+    # Downsample para 15x15 (3x super-resolution)
+    lr_small = cv2.resize(blurred, (15, 15), interpolation=cv2.INTER_AREA)
     
     # Método 2: Adicionar ruído realístico
     noise_std = np.std(lr_small) * 0.02  # 2% do desvio padrão
@@ -118,7 +141,7 @@ def create_fallback_pairs(geosampa_data, valid_mask, output_dir, patch_size, sca
     patches_lr = []
     patches_hr = []
     
-    stride = patch_size // 2
+    stride = patch_size * 2  # Usar mesmo stride do principal
     
     for y in range(0, geosampa_data.shape[0] - patch_size * scale_factor + 1, stride):
         for x in range(0, geosampa_data.shape[1] - patch_size * scale_factor + 1, stride):
@@ -136,9 +159,9 @@ def create_fallback_pairs(geosampa_data, valid_mask, output_dir, patch_size, sca
             patches_lr.append(lr_patch)
             patches_hr.append(hr_patch)
             
-            if len(patches_lr) >= 1000:  # Mais patches para treinamento completo
+            if len(patches_lr) >= 100:  # Reduzido para teste
                 break
-        if len(patches_lr) >= 1000:
+        if len(patches_lr) >= 100:
             break
     
     print(f"✅ Fallback: {len(patches_lr)} pares criados")
@@ -195,8 +218,8 @@ def get_geographic_bounds(ds, geotransform):
 def validate_real_patch_pair(lr_patch, hr_patch):
     """Valida par de patches LR-HR reais."""
     
-    # Verificar dimensões
-    if lr_patch.shape != (30, 30) or hr_patch.shape != (90, 90):
+    # Verificar dimensões (15x15 LR, 45x45 HR para 3x)
+    if lr_patch.shape != (15, 15) or hr_patch.shape != (45, 45):
         return False
     
     # Verificar dados válidos (mais permissivo)
@@ -215,9 +238,9 @@ def validate_real_patch_pair(lr_patch, hr_patch):
     
     return True
 
-def create_advanced_srcnn_model(input_shape=(30, 30, 1), scale_factor=3):
+def create_advanced_srcnn_model(input_shape=(15, 15, 1), scale_factor=3):
     """
-    Cria modelo SRCNN avançado com técnicas modernas.
+    Cria modelo SRCNN avançado com técnicas modernas para 3x super-resolution.
     """
     
     inputs = tf.keras.layers.Input(shape=input_shape)
@@ -305,21 +328,19 @@ def train_advanced_model(patches_dir, epochs=10, batch_size=32):
     return model, history, norm_params
 
 def load_real_patches(patches_dir):
-    """Carrega patches reais LR-HR."""
-    
+    """Carrega patches reais LR-HR com shape correto."""
     lr_files = sorted([f for f in os.listdir(patches_dir) if f.startswith('real_lr_')])
     hr_files = sorted([f for f in os.listdir(patches_dir) if f.startswith('real_hr_')])
-    
     lr_patches = []
     hr_patches = []
-    
     for lr_file, hr_file in zip(lr_files, hr_files):
         lr_patch = np.load(os.path.join(patches_dir, lr_file))
         hr_patch = np.load(os.path.join(patches_dir, hr_file))
-        
-        lr_patches.append(lr_patch)
-        hr_patches.append(hr_patch)
-    
+        if lr_patch.shape == (15, 15) and hr_patch.shape == (45, 45):
+            lr_patches.append(lr_patch)
+            hr_patches.append(hr_patch)
+    if len(lr_patches) == 0 or len(hr_patches) == 0:
+        raise ValueError("Nenhum patch válido encontrado (shape incorreto)")
     return np.array(lr_patches), np.array(hr_patches)
 
 def robust_normalization(lr_patches, hr_patches):
@@ -399,9 +420,9 @@ def stratified_split(lr_patches, hr_patches, test_size=0.2):
 def main():
     """Pipeline de treinamento melhorado."""
     
-    print("🚀 PIPELINE DE TREINAMENTO MELHORADO (VERSÃO COMPLETA)")
+    print("🚀 PIPELINE DE TREINAMENTO MELHORADO (3X SUPER-RESOLUTION)")
     print("=" * 60)
-    print("⚡ Modo completo: 50 épocas, 1000 patches")
+    print("⚡ Modo teste: 5 épocas, patches 15x15→45x45, região 800x800")
     
     # 1. Criar dados reais LR-HR
     print("1️⃣ Criando dados reais...")
@@ -415,8 +436,8 @@ def main():
     print("2️⃣ Treinando modelo avançado...")
     model, history, norm_params = train_advanced_model(
         patches_dir='geospatial_output/real_patches',
-        epochs=50,
-        batch_size=32
+        epochs=15,
+        batch_size=16
     )
     
     print("✅ Treinamento melhorado concluído!")

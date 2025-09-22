@@ -1,436 +1,14 @@
 #!/usr/bin/env python3
 """
-Pipeline híbrido UNIVERSAL - adaptável para qualquer região.
+Super-resolução híbrida: Modelo SRCNN treinado + Interpolação bilinear
+Combina o conhecimento do modelo com a suavidade da interpolação.
 """
 
 import numpy as np
-import tensorflow as tf
 from osgeo import gdal
+import matplotlib.pyplot as plt
 import cv2
 import os
-
-def universal_hybrid_super_resolution(
-    input_path,
-    model_path='geospatial_output/advanced_model_best.keras',
-    output_path=None,
-    scale_factor=3,
-    patch_size=30,
-    overlap=10,
-    min_valid_ratio=0.1  # Mínimo 10% de dados válidos por patch
-):
-    """
-    Super-resolução híbrida UNIVERSAL para qualquer região.
-    
-    Args:
-        input_path: Caminho para o arquivo TIFF de entrada
-        model_path: Caminho para o modelo treinado
-        output_path: Caminho de saída (auto-gerado se None)
-        scale_factor: Fator de escala (padrão: 3x)
-        patch_size: Tamanho do patch (padrão: 30x30)
-        overlap: Sobreposição entre patches (padrão: 10px)
-        min_valid_ratio: Proporção mínima de dados válidos por patch
-    """
-    
-    print("🌍 SUPER-RESOLUÇÃO HÍBRIDA UNIVERSAL")
-    print("=" * 50)
-    print(f"📁 Entrada: {input_path}")
-    print(f"🧠 Modelo: {model_path}")
-    print(f"📊 Escala: {scale_factor}x")
-    print(f"📏 Patch: {patch_size}x{patch_size} (overlap: {overlap}px)")
-    
-    # Auto-gerar nome de saída se não fornecido
-    if output_path is None:
-        base_name = os.path.splitext(os.path.basename(input_path))[0]
-        output_path = f"geospatial_output/{base_name}_super_resolution_{scale_factor}x.tif"
-    
-    print(f"📁 Saída: {output_path}")
-    
-    gdal = _import_gdal()
-    
-    # 1. Carregar modelo
-    model = _load_model_safe(model_path)
-    
-    # 2. Carregar parâmetros de normalização
-    norm_params = _load_normalization_params()
-    
-    # 3. Carregar dados de entrada
-    ds_input = gdal.Open(input_path)
-    if ds_input is None:
-        raise RuntimeError(f"Não foi possível abrir: {input_path}")
-    
-    band_input = ds_input.GetRasterBand(1)
-    data_input = band_input.ReadAsArray()
-    nodata_input = band_input.GetNoDataValue()
-    geotransform = ds_input.GetGeoTransform()
-    projection = ds_input.GetProjection()
-    
-    print(f"📊 Dimensões: {data_input.shape}")
-    print(f"📊 NoData: {nodata_input}")
-    
-    # 4. Detectar automaticamente região válida
-    valid_region = _detect_valid_region(data_input, nodata_input, min_valid_ratio)
-    print(f"📍 Região válida detectada: {valid_region}")
-    
-    if valid_region is None:
-        raise RuntimeError("Nenhuma região válida encontrada no arquivo")
-    
-    # 5. Extrair região válida
-    x_start, y_start, x_end, y_end = valid_region
-    data_cropped = data_input[y_start:y_end, x_start:x_end]
-    valid_mask_cropped = _create_valid_mask(data_cropped, nodata_input)
-    
-    print(f"📊 Dados válidos: {np.sum(valid_mask_cropped)/valid_mask_cropped.size*100:.1f}%")
-    
-    # 6. Aplicar super-resolução
-    result_data = apply_universal_super_resolution(
-        data_cropped, valid_mask_cropped, model, norm_params, 
-        patch_size, overlap, scale_factor
-    )
-    
-    # 7. Salvar resultado com georeferenciamento correto
-    _save_universal_tiff(
-        result_data, ds_input, (x_start, y_start), output_path, 
-        scale_factor, nodata_input
-    )
-    
-    # 8. Limpar
-    ds_input = None
-    
-    print("✅ Super-resolução universal concluída!")
-    print(f"📁 Resultado: {output_path}")
-
-def _detect_valid_region(data, nodata_value, min_valid_ratio):
-    """
-    Detecta automaticamente a região válida no arquivo.
-    """
-    
-    # Criar máscara de dados válidos
-    if nodata_value is not None:
-        valid_mask = (data != nodata_value) & ~np.isnan(data) & ~np.isinf(data)
-    else:
-        valid_mask = ~np.isnan(data) & ~np.isinf(data)
-    
-    if not np.any(valid_mask):
-        return None
-    
-    # Encontrar bounding box dos dados válidos
-    valid_coords = np.where(valid_mask)
-    y_min, y_max = np.min(valid_coords[0]), np.max(valid_coords[0])
-    x_min, x_max = np.min(valid_coords[1]), np.max(valid_coords[1])
-    
-    # Adicionar margem de segurança (10% em cada direção)
-    height, width = data.shape
-    margin_y = max(1, int((y_max - y_min) * 0.1))
-    margin_x = max(1, int((x_max - x_min) * 0.1))
-    
-    y_start = max(0, y_min - margin_y)
-    y_end = min(height, y_max + margin_y + 1)
-    x_start = max(0, x_min - margin_x)
-    x_end = min(width, x_max + margin_x + 1)
-    
-    return (x_start, y_start, x_end, y_end)
-
-def _create_valid_mask(data, nodata_value):
-    """Cria máscara de dados válidos."""
-    
-    if nodata_value is not None:
-        valid_mask = (data != nodata_value) & ~np.isnan(data) & ~np.isinf(data)
-    else:
-        valid_mask = ~np.isnan(data) & ~np.isinf(data)
-    
-    return valid_mask
-
-def apply_universal_super_resolution(data, valid_mask, model, norm_params, 
-                                   patch_size, overlap, scale_factor):
-    """
-    Aplica super-resolução universal com composição inteligente.
-    """
-    
-    height, width = data.shape
-    output_height = height * scale_factor
-    output_width = width * scale_factor
-    
-    # Inicializar arrays de resultado
-    result = np.zeros((output_height, output_width), dtype=np.float32)
-    count = np.zeros((output_height, output_width), dtype=np.float32)
-    
-    # Criar máscara de peso para blending
-    weight_mask = _create_weight_mask(patch_size * scale_factor, overlap * scale_factor)
-    
-    stride = max(1, patch_size - overlap)
-    
-    print(f"🔄 Processando patches com stride {stride}px...")
-    
-    patches_processed = 0
-    patches_skipped = 0
-    
-    for y in range(0, height - patch_size + 1, stride):
-        for x in range(0, width - patch_size + 1, stride):
-            # Verificar se patch tem dados válidos suficientes
-            patch_valid = valid_mask[y:y+patch_size, x:x+patch_size]
-            valid_ratio = np.sum(patch_valid) / (patch_size * patch_size)
-            
-            if valid_ratio < 0.1:  # Menos de 10% válidos
-                patches_skipped += 1
-                continue
-            
-            # Extrair patch LR
-            lr_patch = data[y:y+patch_size, x:x+patch_size].copy()
-            
-            # Preencher NoData com interpolação inteligente
-            lr_patch = _fill_nodata_smart(lr_patch, patch_valid)
-            
-            # Normalizar
-            lr_norm = _normalize_patch_universal(lr_patch, norm_params)
-            
-            # Aplicar modelo
-            lr_input = lr_norm.reshape(1, patch_size, patch_size, 1)
-            hr_pred = model.predict(lr_input, verbose=0)
-            hr_pred = hr_pred.reshape(patch_size * scale_factor, patch_size * scale_factor)
-            
-            # Desnormalizar
-            hr_pred = _denormalize_patch_universal(hr_pred, norm_params)
-            
-            # Aplicar máscara de peso
-            hr_pred *= weight_mask
-            
-            # Adicionar ao resultado com blending
-            y_out = y * scale_factor
-            x_out = x * scale_factor
-            h_out = patch_size * scale_factor
-            w_out = patch_size * scale_factor
-            
-            result[y_out:y_out+h_out, x_out:x_out+w_out] += hr_pred
-            count[y_out:y_out+h_out, x_out:x_out+w_out] += weight_mask
-            
-            patches_processed += 1
-            
-            if patches_processed % 100 == 0:
-                print(f"  📊 Processados: {patches_processed}, Pulados: {patches_skipped}")
-    
-    # Normalizar por contagem (blending final)
-    valid_count = count > 0
-    result[valid_count] /= count[valid_count]
-    
-    # Preencher áreas vazias com interpolação
-    result = _fill_empty_areas_universal(result, valid_mask, scale_factor)
-    
-    print(f"✅ Total: {patches_processed} processados, {patches_skipped} pulados")
-    
-    return result
-
-def _fill_nodata_smart(patch, valid_mask):
-    """
-    Preenche NoData de forma inteligente usando interpolação adaptativa.
-    """
-    
-    if np.all(valid_mask):
-        return patch
-    
-    patch_filled = patch.copy()
-    invalid_mask = ~valid_mask
-    
-    if np.any(invalid_mask):
-        # Usar interpolação bilinear para preencher gaps
-        try:
-            patch_filled = cv2.inpaint(
-                patch.astype(np.uint8), 
-                invalid_mask.astype(np.uint8), 
-                inpaintRadius=3, 
-                flags=cv2.INPAINT_TELEA
-            ).astype(np.float32)
-        except:
-            # Fallback: usar média dos vizinhos válidos
-            patch_filled = _fill_with_neighbor_average(patch, valid_mask)
-    
-    return patch_filled
-
-def _fill_with_neighbor_average(patch, valid_mask):
-    """
-    Preenche NoData com média dos vizinhos válidos (fallback).
-    """
-    
-    patch_filled = patch.copy()
-    invalid_mask = ~valid_mask
-    
-    if not np.any(invalid_mask):
-        return patch_filled
-    
-    # Usar convolução para calcular média dos vizinhos
-    kernel = np.ones((3, 3), dtype=np.float32) / 9
-    valid_patch = patch.copy()
-    valid_patch[invalid_mask] = 0
-    
-    # Convolução para média
-    neighbor_sum = cv2.filter2D(valid_patch, -1, kernel)
-    neighbor_count = cv2.filter2D(valid_mask.astype(np.float32), -1, kernel)
-    
-    # Evitar divisão por zero
-    neighbor_count[neighbor_count == 0] = 1
-    neighbor_avg = neighbor_sum / neighbor_count
-    
-    # Preencher apenas onde há vizinhos válidos
-    fill_mask = invalid_mask & (neighbor_count > 0)
-    patch_filled[fill_mask] = neighbor_avg[fill_mask]
-    
-    return patch_filled
-
-def _fill_empty_areas_universal(result, original_valid_mask, scale_factor):
-    """
-    Preenche áreas vazias com interpolação universal.
-    """
-    
-    # Upscale da máscara original
-    valid_upscaled = cv2.resize(
-        original_valid_mask.astype(np.uint8), 
-        (result.shape[1], result.shape[0]), 
-        interpolation=cv2.INTER_NEAREST
-    ).astype(bool)
-    
-    # Identificar áreas vazias que deveriam ter dados
-    empty_mask = (result == 0) & valid_upscaled
-    
-    if not np.any(empty_mask):
-        return result
-    
-    # Interpolação bilinear nas áreas vazias válidas
-    result_interp = cv2.resize(
-        result, (result.shape[1], result.shape[0]), 
-        interpolation=cv2.INTER_LINEAR
-    )
-    
-    result[empty_mask] = result_interp[empty_mask]
-    
-    return result
-
-def _create_weight_mask(patch_size, overlap):
-    """Cria máscara de peso para blending suave."""
-    
-    mask = np.ones((patch_size, patch_size), dtype=np.float32)
-    
-    # Reduzir peso nas bordas para blending suave
-    fade_size = max(1, overlap // 2)
-    
-    # Bordas superior e inferior
-    for i in range(fade_size):
-        weight = (i + 1) / fade_size
-        mask[i, :] *= weight
-        mask[-(i+1), :] *= weight
-    
-    # Bordas esquerda e direita
-    for j in range(fade_size):
-        weight = (j + 1) / fade_size
-        mask[:, j] *= weight
-        mask[:, -(j+1)] *= weight
-    
-    return mask
-
-def _normalize_patch_universal(patch, norm_params):
-    """Normalização universal usando parâmetros de treinamento."""
-    
-    lr_min = norm_params.get('lr_min', 0)
-    lr_max = norm_params.get('lr_max', 1)
-    
-    if lr_max - lr_min < 1e-6:
-        return np.zeros_like(patch)
-    
-    normalized = (patch - lr_min) / (lr_max - lr_min)
-    return np.clip(normalized, 0, 1)
-
-def _denormalize_patch_universal(patch, norm_params):
-    """Desnormalização universal usando parâmetros de treinamento."""
-    
-    hr_min = norm_params.get('hr_min', 0)
-    hr_max = norm_params.get('hr_max', 1)
-    
-    if hr_max - hr_min < 1e-6:
-        return patch
-    
-    denormalized = patch * (hr_max - hr_min) + hr_min
-    return denormalized
-
-def _load_normalization_params():
-    """Carrega parâmetros de normalização com fallback."""
-    
-    try:
-        norm_params = np.load('geospatial_output/norm_params.npy', allow_pickle=True).item()
-        print("✅ Parâmetros de normalização carregados")
-        return norm_params
-    except:
-        print("⚠️  Parâmetros não encontrados, usando padrão")
-        return {'lr_min': 0, 'lr_max': 1, 'hr_min': 0, 'hr_max': 1}
-
-def _save_universal_tiff(data, source_ds, crop_offset, output_path, scale_factor, nodata_value):
-    """
-    Salva TIFF com georeferenciamento universal.
-    """
-    
-    gdal = _import_gdal()
-    
-    # Obter geotransform original
-    geotransform = source_ds.GetGeoTransform()
-    projection = source_ds.GetProjection()
-    
-    # Ajustar geotransform para crop e escala
-    x_offset, y_offset = crop_offset
-    new_geotransform = list(geotransform)
-    new_geotransform[0] = geotransform[0] + x_offset * geotransform[1]  # X origin
-    new_geotransform[3] = geotransform[3] + y_offset * geotransform[5]  # Y origin
-    new_geotransform[1] = geotransform[1] / scale_factor  # Pixel width
-    new_geotransform[5] = geotransform[5] / scale_factor  # Pixel height
-    
-    # Criar dataset de saída
-    driver = gdal.GetDriverByName('GTiff')
-    ds_out = driver.Create(
-        output_path, 
-        data.shape[1], data.shape[0], 
-        1, gdal.GDT_Float32,
-        options=['COMPRESS=LZW', 'TILED=YES', 'BIGTIFF=IF_SAFER']
-    )
-    
-    if ds_out is None:
-        raise RuntimeError(f"Não foi possível criar: {output_path}")
-    
-    # Definir georeferenciamento
-    ds_out.SetGeoTransform(new_geotransform)
-    ds_out.SetProjection(projection)
-    
-    # Escrever dados
-    band_out = ds_out.GetRasterBand(1)
-    band_out.WriteArray(data)
-    
-    if nodata_value is not None:
-        band_out.SetNoDataValue(nodata_value)
-    
-    # Fechar
-    ds_out = None
-    
-    print(f"💾 Salvo: {output_path}")
-
-def _load_model_safe(model_path):
-    """Carrega modelo com fallback seguro."""
-    
-    try:
-        model = tf.keras.models.load_model(model_path, safe_mode=False)
-        print(f"✅ Modelo carregado: {model_path}")
-        return model
-    except Exception as e:
-        print(f"⚠️  Erro ao carregar modelo: {e}")
-        print("🔄 Usando modelo simples...")
-        return _create_simple_model()
-
-def _create_simple_model():
-    """Cria modelo simples como fallback."""
-    
-    inputs = tf.keras.Input(shape=(30, 30, 1))
-    x = tf.keras.layers.Conv2D(64, (9, 9), activation='relu', padding='same')(inputs)
-    x = tf.keras.layers.Conv2D(32, (1, 1), activation='relu', padding='same')(x)
-    x = tf.keras.layers.Conv2D(1, (5, 5), activation='linear', padding='same')(x)
-    x = tf.keras.layers.UpSampling2D(size=(3, 3), interpolation='bilinear')(x)
-    
-    model = tf.keras.models.Model(inputs=inputs, outputs=x)
-    print("✅ Modelo simples criado")
-    return model
 
 def _import_gdal():
     """Importa GDAL com tratamento de erro."""
@@ -438,11 +16,431 @@ def _import_gdal():
         from osgeo import gdal
         return gdal
     except Exception as e:
-        raise ImportError("Falha ao importar GDAL") from e
+        raise ImportError("Falha ao importar GDAL (osgeo)") from e
+
+def _load_srcnn_model(model_path: str):
+    """Carrega apenas o modelo SRCNN treinado (sem upscaling)."""
+    try:
+        import tensorflow as tf
+        model = tf.keras.models.load_model(model_path)
+        print(f"✅ Modelo SRCNN carregado: {model_path}")
+        print(f"   Input: {model.input_shape}")
+        print(f"   Output: {model.output_shape}")
+        return model
+    except Exception as e:
+        raise RuntimeError(f"Erro ao carregar modelo: {e}")
+
+def _load_normalization_params():
+    """Carregar parâmetros de normalização salvos do treinamento."""
+    norm_path = 'geospatial_output/norm_params.npy'
+    
+    if not os.path.exists(norm_path):
+        raise RuntimeError(f"Parâmetros de normalização não encontrados: {norm_path}")
+    
+    norm_params = np.load(norm_path, allow_pickle=True).item()
+    
+    # Usar parâmetros do HR (que é o que o modelo gera)
+    data_min = norm_params['hr_min']
+    data_max = norm_params['hr_max']
+    
+    print(f"📊 Parâmetros de normalização carregados:")
+    print(f"   HR Min: {data_min:.2f}")
+    print(f"   HR Max: {data_max:.2f}")
+    
+    return data_min, data_max
+
+def _normalize_patch(patch: np.ndarray, data_min: float, data_max: float) -> np.ndarray:
+    """Normaliza patch usando parâmetros do GEOSAMPA."""
+    eps = 1e-12
+    range_val = max(eps, (data_max - data_min))
+    normalized = (patch - data_min) / range_val
+    return np.clip(normalized, 0.0, 1.0)
+
+def _denormalize_patch(patch: np.ndarray, data_min: float, data_max: float) -> np.ndarray:
+    """Desnormaliza patch para escala original."""
+    return patch * (data_max - data_min) + data_min
+
+def hybrid_anadem_super_resolution(
+    anadem_path='data/images/ANADEM_AricanduvaBufferUTM.tif',
+    model_path='geospatial_output/advanced_model_best.keras',
+    output_path='geospatial_output/anadem_hybrid_super_resolution_3x.tif',
+    scale_factor=3,
+    patch_size=15,
+    overlap=7,
+    use_model_weight=0.7  # 70% modelo, 30% interpolação
+):
+    """
+    Aplica super-resolução híbrida: modelo + interpolação (3x).
+    
+    Args:
+        anadem_path: Caminho do ANADEM
+        model_path: Caminho do modelo treinado (3x)
+        output_path: Caminho de saída
+        scale_factor: Fator de upscaling (3x)
+        patch_size: Tamanho dos patches (15x15)
+        overlap: Sobreposição entre patches
+        use_model_weight: Peso do modelo vs interpolação (0.0-1.0)
+    """
+    
+    print("🚀 SUPER-RESOLUÇÃO HÍBRIDA - ANADEM")
+    print("=" * 50)
+    print(f"📁 ANADEM: {anadem_path}")
+    print(f"🧠 Modelo: {model_path}")
+    print(f"📁 Saída: {output_path}")
+    print(f"🔧 Método: {use_model_weight*100:.0f}% Modelo + {(1-use_model_weight)*100:.0f}% Interpolação")
+    print(f"🔍 Scale factor: {scale_factor}x")
+    
+    gdal = _import_gdal()
+    
+    # 1. Carregar modelo SRCNN
+    srcnn_model = _load_srcnn_model(model_path)
+    
+    # 2. Obter parâmetros de normalização
+    data_min, data_max = _load_normalization_params()
+    
+    # 3. Carregar ANADEM
+    ds_anadem = gdal.Open(anadem_path)
+    if ds_anadem is None:
+        raise RuntimeError(f"Não foi possível abrir: {anadem_path}")
+    
+    band_anadem = ds_anadem.GetRasterBand(1)
+    data_anadem = band_anadem.ReadAsArray()
+    nodata_anadem = band_anadem.GetNoDataValue()
+    geotransform = ds_anadem.GetGeoTransform()
+    projection = ds_anadem.GetProjection()
+    
+    height, width = data_anadem.shape
+    print(f"📊 ANADEM: {width} x {height} pixels")
+    
+    # 4. Verificar compatibilidade
+    valid_mask = ~np.isnan(data_anadem) & ~np.isinf(data_anadem)
+    if nodata_anadem is not None:
+        valid_mask = valid_mask & (data_anadem != nodata_anadem)
+    
+    valid_data = data_anadem[valid_mask]
+    if len(valid_data) > 0:
+        anadem_min, anadem_max = np.min(valid_data), np.max(valid_data)
+        print(f"📊 ANADEM range: {anadem_min:.2f} - {anadem_max:.2f}")
+        
+        if anadem_min < data_min or anadem_max > data_max:
+            print("⚠️  ANADEM fora do range de treinamento - resultados podem variar")
+    
+    # 5. MÉTODO 1: Super-resolução usando modelo SRCNN (patch por patch)
+    print("🧠 Aplicando modelo SRCNN...")
+    
+    # Usar stride menor para melhor cobertura
+    stride = max(1, patch_size - overlap)
+    num_patches_x = (width - patch_size) // stride + 1
+    num_patches_y = (height - patch_size) // stride + 1
+    
+    print(f"📊 Processando {num_patches_x} x {num_patches_y} = {num_patches_x * num_patches_y} patches")
+    
+    model_result = np.zeros((height, width), dtype=np.float32)
+    model_weights = np.zeros((height, width), dtype=np.float32)
+    
+    processed_patches = 0
+    valid_patches = 0
+    
+    for j in range(num_patches_y):
+        for i in range(num_patches_x):
+            x = i * stride
+            y = j * stride
+            
+            # Verificar limites
+            if x + patch_size > width or y + patch_size > height:
+                continue
+            
+            try:
+                # Extrair patch
+                patch = data_anadem[y:y+patch_size, x:x+patch_size]
+                
+                # Verificar dados válidos (critério mais relaxado)
+                patch_valid_mask = ~np.isnan(patch) & ~np.isinf(patch)
+                if nodata_anadem is not None:
+                    patch_valid_mask = patch_valid_mask & (patch != nodata_anadem)
+                
+                # Relaxar critério: aceitar patches com pelo menos 20% de dados válidos
+                if np.sum(patch_valid_mask) < patch_size * patch_size * 0.2:
+                    continue
+                
+                # Interpolar valores inválidos de forma mais robusta
+                if np.sum(~patch_valid_mask) > 0:
+                    valid_values = patch[patch_valid_mask]
+                    if len(valid_values) > 0:
+                        # Usar interpolação espacial em vez de média simples
+                        from scipy import ndimage
+                        try:
+                            # Interpolação por distância inversa
+                            patch_interp = patch.copy()
+                            patch_interp[~patch_valid_mask] = 0
+                            patch_interp = ndimage.gaussian_filter(patch_interp, sigma=1.0)
+                            patch[~patch_valid_mask] = patch_interp[~patch_valid_mask]
+                        except:
+                            # Fallback para média se scipy não estiver disponível
+                            patch[~patch_valid_mask] = np.mean(valid_values)
+                
+                # Normalizar
+                patch_norm = _normalize_patch(patch, data_min, data_max)
+                
+                # Aplicar modelo
+                patch_input = patch_norm[..., None][None, ...]
+                enhanced_patch = srcnn_model.predict(patch_input, verbose=0)[0, :, :, 0]
+                
+                # Desnormalizar
+                enhanced_patch = _denormalize_patch(enhanced_patch, data_min, data_max)
+                
+                # Adicionar ao resultado com pesos
+                weight_mask = np.ones((patch_size, patch_size))
+                if overlap > 0:
+                    for margin in range(min(overlap, patch_size//4)):
+                        weight_mask[margin, :] *= 0.5
+                        weight_mask[-margin-1, :] *= 0.5
+                        weight_mask[:, margin] *= 0.5
+                        weight_mask[:, -margin-1] *= 0.5
+                
+                model_result[y:y+patch_size, x:x+patch_size] += enhanced_patch * weight_mask
+                model_weights[y:y+patch_size, x:x+patch_size] += weight_mask
+                
+                valid_patches += 1
+                
+            except Exception as e:
+                continue
+            
+            processed_patches += 1
+            if processed_patches % 50 == 0:
+                print(f"   Processados {processed_patches} patches...")
+    
+    # Normalizar resultado do modelo
+    valid_model_mask = model_weights > 0
+    model_result[valid_model_mask] = model_result[valid_model_mask] / model_weights[valid_model_mask]
+    
+    print(f"✅ Modelo aplicado: {valid_patches}/{processed_patches} patches válidos")
+    
+    # Processar patches adicionais nas bordas para melhor cobertura
+    print("🔄 Processando patches de borda...")
+    edge_patches = 0
+    
+    # Patches nas bordas direita e inferior
+    for j in range(num_patches_y):
+        # Borda direita
+        x = width - patch_size
+        y = j * stride
+        if y + patch_size <= height:
+            try:
+                patch = data_anadem[y:y+patch_size, x:x+patch_size]
+                patch_valid_mask = ~np.isnan(patch) & ~np.isinf(patch)
+                if nodata_anadem is not None:
+                    patch_valid_mask = patch_valid_mask & (patch != nodata_anadem)
+                
+                if np.sum(patch_valid_mask) >= patch_size * patch_size * 0.2:
+                    # Interpolar valores inválidos
+                    if np.sum(~patch_valid_mask) > 0:
+                        valid_values = patch[patch_valid_mask]
+                        if len(valid_values) > 0:
+                            patch[~patch_valid_mask] = np.mean(valid_values)
+                    
+                    # Aplicar modelo
+                    patch_norm = _normalize_patch(patch, data_min, data_max)
+                    patch_input = patch_norm[..., None][None, ...]
+                    enhanced_patch = srcnn_model.predict(patch_input, verbose=0)[0, :, :, 0]
+                    enhanced_patch = _denormalize_patch(enhanced_patch, data_min, data_max)
+                    
+                    # Adicionar com peso reduzido (borda)
+                    weight_mask = np.ones((patch_size, patch_size)) * 0.5
+                    model_result[y:y+patch_size, x:x+patch_size] += enhanced_patch * weight_mask
+                    model_weights[y:y+patch_size, x:x+patch_size] += weight_mask
+                    edge_patches += 1
+            except:
+                pass
+    
+    # Borda inferior
+    for i in range(num_patches_x):
+        x = i * stride
+        y = height - patch_size
+        if x + patch_size <= width:
+            try:
+                patch = data_anadem[y:y+patch_size, x:x+patch_size]
+                patch_valid_mask = ~np.isnan(patch) & ~np.isinf(patch)
+                if nodata_anadem is not None:
+                    patch_valid_mask = patch_valid_mask & (patch != nodata_anadem)
+                
+                if np.sum(patch_valid_mask) >= patch_size * patch_size * 0.2:
+                    # Interpolar valores inválidos
+                    if np.sum(~patch_valid_mask) > 0:
+                        valid_values = patch[patch_valid_mask]
+                        if len(valid_values) > 0:
+                            patch[~patch_valid_mask] = np.mean(valid_values)
+                    
+                    # Aplicar modelo
+                    patch_norm = _normalize_patch(patch, data_min, data_max)
+                    patch_input = patch_norm[..., None][None, ...]
+                    enhanced_patch = srcnn_model.predict(patch_input, verbose=0)[0, :, :, 0]
+                    enhanced_patch = _denormalize_patch(enhanced_patch, data_min, data_max)
+                    
+                    # Adicionar com peso reduzido (borda)
+                    weight_mask = np.ones((patch_size, patch_size)) * 0.5
+                    model_result[y:y+patch_size, x:x+patch_size] += enhanced_patch * weight_mask
+                    model_weights[y:y+patch_size, x:x+patch_size] += weight_mask
+                    edge_patches += 1
+            except:
+                pass
+    
+    print(f"✅ Patches de borda processados: {edge_patches}")
+    
+    # 6. MÉTODO 2: Interpolação bilinear simples
+    print("📐 Aplicando interpolação bilinear...")
+    
+    # Preparar dados para interpolação
+    data_for_interp = data_anadem.copy().astype(np.float64)
+    if nodata_anadem is not None:
+        data_for_interp[data_anadem == nodata_anadem] = np.nan
+    
+    # Fazer upscaling bilinear
+    new_height = height * scale_factor
+    new_width = width * scale_factor
+    interp_result = cv2.resize(data_for_interp, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+    
+    # 7. MÉTODO 3: Combinar modelo + interpolação com cobertura melhorada
+    print("🔄 Combinando resultados...")
+    
+    # Fazer upscaling do resultado do modelo
+    model_upscaled = cv2.resize(model_result, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+    
+    # Fazer upscaling dos pesos do modelo
+    model_weights_upscaled = cv2.resize(model_weights, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+    
+    # Combinar usando pesos suavizados
+    final_result = np.zeros_like(interp_result)
+    
+    # Máscara de dados válidos na interpolação
+    valid_interp_mask = ~np.isnan(interp_result) & ~np.isinf(interp_result)
+    
+    # Máscara de cobertura do modelo (suavizada)
+    model_coverage_mask = model_weights_upscaled > 0.1  # Threshold mais baixo
+    
+    # Aplicar filtro gaussiano para suavizar transições
+    try:
+        from scipy import ndimage
+        model_coverage_smooth = ndimage.gaussian_filter(model_coverage_mask.astype(np.float32), sigma=2.0)
+    except:
+        model_coverage_smooth = model_coverage_mask.astype(np.float32)
+    
+    # Normalizar pesos para 0-1
+    if np.max(model_coverage_smooth) > 0:
+        model_coverage_smooth = model_coverage_smooth / np.max(model_coverage_smooth)
+    
+    # Combinar usando pesos adaptativos
+    final_result = (
+        model_coverage_smooth * use_model_weight * model_upscaled + 
+        (1 - model_coverage_smooth * use_model_weight) * interp_result
+    )
+    
+    # Garantir que áreas sem dados válidos mantenham NoData
+    final_result[~valid_interp_mask] = interp_result[~valid_interp_mask]
+    
+    # Restaurar NoData
+    if nodata_anadem is not None:
+        final_result[~valid_interp_mask] = nodata_anadem
+    
+    # 8. Verificar resultado final
+    print("🔍 Verificando resultado...")
+    final_valid_mask = ~np.isnan(final_result) & ~np.isinf(final_result)
+    if nodata_anadem is not None:
+        final_valid_mask = final_valid_mask & (final_result != nodata_anadem)
+    
+    final_valid_data = final_result[final_valid_mask]
+    if len(final_valid_data) > 0:
+        print(f"📊 Resultado final: {np.min(final_valid_data):.2f} - {np.max(final_valid_data):.2f}")
+        print(f"📊 Cobertura modelo: {np.sum(model_coverage_mask)/model_coverage_mask.size*100:.1f}%")
+        print(f"📊 Cobertura suavizada: {np.sum(model_coverage_smooth > 0.1)/model_coverage_smooth.size*100:.1f}%")
+    
+    # 9. Salvar resultado
+    print("💾 Salvando resultado...")
+    
+    # Ajustar geotransform
+    new_geotransform = list(geotransform)
+    new_geotransform[1] = geotransform[1] / scale_factor
+    new_geotransform[5] = geotransform[5] / scale_factor
+    
+    # Criar dataset de saída
+    driver = gdal.GetDriverByName('GTiff')
+    options = ['COMPRESS=LZW', 'TILED=YES']
+    out_ds = driver.Create(output_path, new_width, new_height, 1, gdal.GDT_Float32, options=options)
+    
+    out_ds.SetGeoTransform(new_geotransform)
+    out_ds.SetProjection(projection)
+    
+    out_band = out_ds.GetRasterBand(1)
+    
+    # LIMPEZA FINAL: Remover NaN/Inf antes de salvar
+    print("🧹 Limpando dados finais (removendo NaN/Inf)...")
+    final_result_clean = final_result.copy()
+    
+    # Identificar valores inválidos
+    invalid_mask = np.isnan(final_result_clean) | np.isinf(final_result_clean)
+    
+    if np.sum(invalid_mask) > 0:
+        print(f"⚠️  Encontrados {np.sum(invalid_mask)} valores inválidos")
+        
+        # Substituir por interpolação bilinear limpa
+        if nodata_anadem is not None:
+            final_result_clean[invalid_mask] = nodata_anadem
+        else:
+            # Usar valor médio dos dados válidos
+            valid_data = final_result_clean[~invalid_mask]
+            if len(valid_data) > 0:
+                mean_value = np.mean(valid_data)
+                final_result_clean[invalid_mask] = mean_value
+            else:
+                final_result_clean[invalid_mask] = 0.0
+    
+    # Verificar resultado final limpo
+    final_clean_valid = ~np.isnan(final_result_clean) & ~np.isinf(final_result_clean)
+    if np.sum(final_clean_valid) > 0:
+        clean_data = final_result_clean[final_clean_valid]
+        print(f"📊 Dados limpos: {np.min(clean_data):.2f} - {np.max(clean_data):.2f}")
+    
+    out_band.WriteArray(final_result_clean.astype(np.float32))
+    if nodata_anadem is not None:
+        out_band.SetNoDataValue(nodata_anadem)
+    
+    out_band.ComputeStatistics(False)
+    out_ds.SetDescription(f'ANADEM Hybrid Super-Resolution ({scale_factor}x) - SRCNN + Bilinear')
+    
+    out_ds = None
+    ds_anadem = None
+    
+    print(f"✅ Super-resolução híbrida concluída!")
+    print(f"📁 Arquivo: {output_path}")
+    print(f"📊 Resolução: {geotransform[1]:.1f}m → {new_geotransform[1]:.1f}m por pixel")
+    
+    return output_path
+
+def main():
+    """Função principal."""
+    
+    print("🎯 SUPER-RESOLUÇÃO HÍBRIDA - ANADEM")
+    print("Combinando modelo SRCNN + interpolação bilinear")
+    print("=" * 60)
+    
+    try:
+        result_path = hybrid_anadem_super_resolution(
+            anadem_path='data/images/ANADEM_AricanduvaBufferUTM.tif',
+            model_path='geospatial_output/advanced_model_best.keras',
+            output_path='geospatial_output/anadem_hybrid_super_resolution_3x.tif',
+            scale_factor=3,
+            use_model_weight=0.7  # 70% modelo, 30% interpolação
+        )
+        
+        print(f"\n🎉 SUCESSO!")
+        print(f"📁 Resultado: {result_path}")
+        print(f"\n💡 O resultado combina:")
+        print(f"   • 70% Conhecimento do modelo SRCNN")
+        print(f"   • 30% Suavidade da interpolação bilinear")
+        print(f"\n✅ Abra no QGIS para verificar a qualidade!")
+        
+    except Exception as e:
+        print(f"❌ Erro: {e}")
 
 if __name__ == "__main__":
-    # Exemplo de uso universal
-    universal_hybrid_super_resolution(
-        input_path='data/images/ANADEM_AricanduvaBufferUTM.tif',
-        output_path='geospatial_output/universal_result.tif'
-    )
+    main()
