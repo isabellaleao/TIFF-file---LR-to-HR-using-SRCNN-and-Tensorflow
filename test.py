@@ -63,10 +63,10 @@ def _save_raster(path, arr, gt, prj, nodata=None):
 
 
 def main():
-    anadem_path = 'data/images/Recorte_SP.tif'
+    anadem_path = 'data/images/ANADEM_AricanduvaBufferUTM.tif'
     model_path = 'geospatial_output/advanced_model_best.keras'
     norm_params_path = 'geospatial_output/norm_params.npy'
-    out_path = 'geospatial_output/recorte_model_only_3x.tif'
+    out_path = 'geospatial_output/ANADEM_model_only_3x.tif'
     scale_factor = 3
 
     # Carregar modelo e normalização
