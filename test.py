@@ -63,11 +63,12 @@ def _save_raster(path, arr, gt, prj, nodata=None):
 
 
 def main():
-    anadem_path = 'data/images/ANADEM_AricanduvaBufferUTM.tif'
-    model_path = 'geospatial_output/advanced_model_best.keras'
-    norm_params_path = 'geospatial_output/norm_params.npy'
-    out_path = 'geospatial_output/ANADEM_model_only_3x.tif'
-    scale_factor = 3
+    anadem_path = 'data/images/Recorte_IPT/ANADEM_Recorte_IPT.tif'
+    model_path = 'geospatial_output/advanced_model_5m_best.keras'
+    norm_params_path = 'geospatial_output/norm_params_5m.npy'
+    out_path = 'geospatial_output/ANADEM_Recorte_IPT_model_only_5m.tif'
+    scale_factor = 3  # Fator de escala da rede neural (45x45 → 15x15)
+    spatial_scale = 6  # Fator de resolução espacial (30m → 5m)
 
     # Carregar modelo e normalização
     model = _load_model(model_path, scale_factor=scale_factor)
@@ -99,15 +100,15 @@ def main():
     # Desnormalizar
     out_hr = pred * (data_max - data_min) + data_min
 
-    # Propagar máscara de inválidos para a saída em 10 m
+    # Propagar máscara de inválidos para a saída em 5 m
     if np.any(~valid_mask):
         mask_hr = np.repeat(np.repeat(valid_mask.astype(np.uint8), scale_factor, axis=0), scale_factor, axis=1) > 0
         out_hr[~mask_hr] = np.nan
 
-    # Geotransform para 10 m
+    # Geotransform para 5 m (dividir por spatial_scale, não scale_factor)
     gt_hr = list(gt)
-    gt_hr[1] = gt[1] / scale_factor
-    gt_hr[5] = gt[5] / scale_factor
+    gt_hr[1] = gt[1] / spatial_scale  # Pixel width: 30m → 5m
+    gt_hr[5] = gt[5] / spatial_scale  # Pixel height: 30m → 5m
 
     # Salvar TIFF final (área inteira)
     _save_raster(out_path, out_hr, tuple(gt_hr), prj, nodata=nodata)
